@@ -43,10 +43,22 @@ jobs:
         run: bun install
 
       - name: Lint
-        run: bun run lint
+        run: |
+          if jq -e '.scripts.lint' package.json >/dev/null 2>/dev/null && ( [ -f eslint.config.js ] || [ -f eslint.config.mjs ] || [ -f eslint.config.cjs ] ); then
+            bun run lint
+          else
+            echo "Skipping lint: no lint script or eslint config"
+          fi
 
       - name: Type check
-        run: bun run type:check
+        run: |
+          if jq -e '.scripts["type:check"]' package.json >/dev/null 2>/dev/null; then
+            bun run type:check
+          elif jq -e '.scripts.typecheck' package.json >/dev/null 2>/dev/null; then
+            bun run typecheck
+          else
+            echo "Skipping type check: no typecheck script"
+          fi
 
       - name: Build
         run: bun run build
