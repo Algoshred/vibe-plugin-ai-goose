@@ -1,6 +1,6 @@
 {
   "name": "@vibecontrols/vibe-plugin-goose",
-  "version": "1.0.0",
+  "version": "2026.428.1",
   "type": "module",
   "main": "./dist/index.js",
   "description": "Goose AI agent provider for VibeControls",
