@@ -5,15 +5,32 @@
  * CLI-only provider — spawns the CLI binary for prompt execution.
  */
 
+import { Elysia } from "elysia";
+
 // ── Locally Redeclared Interfaces ────────────────────────────────────────
+
+type ProviderMode = "sdk" | "cli";
 
 interface VibePlugin {
   name: string;
   version: string;
   description?: string;
-  tags?: Array<"backend" | "frontend" | "cli" | "provider" | "adapter" | "integration">;
+  tags?: Array<
+    "backend" | "frontend" | "cli" | "provider" | "adapter" | "integration"
+  >;
+  apiPrefix?: string;
+  prerequisites?: Array<{
+    name: string;
+    kind: "binary" | "npm" | "pip" | "cargo" | "manual";
+    requiresSudo: boolean;
+    description?: string;
+  }>;
+  createRoutes?: () => unknown;
   providers?: { ai?: AIAgentProvider; [key: string]: unknown };
-  onServerStart?: (app: unknown, hostServices?: HostServices) => void | Promise<void>;
+  onServerStart?: (
+    app: unknown,
+    hostServices?: HostServices,
+  ) => void | Promise<void>;
   onServerStop?: () => void | Promise<void>;
 }
 
@@ -30,8 +47,19 @@ interface HostServices {
   getConfig: (key: string) => string | undefined;
 }
 
-type AISessionStatus = "active" | "idle" | "processing" | "error" | "terminated";
-type AILogType = "input" | "output" | "thinking" | "event" | "error" | "metadata";
+type AISessionStatus =
+  | "active"
+  | "idle"
+  | "processing"
+  | "error"
+  | "terminated";
+type AILogType =
+  | "input"
+  | "output"
+  | "thinking"
+  | "event"
+  | "error"
+  | "metadata";
 
 interface AISessionConfig {
   name: string;
@@ -56,32 +84,88 @@ interface AISession {
   updatedAt: string;
 }
 
-interface AIContext { id: string; type: string; content: string; metadata?: Record<string, unknown>; }
-interface AIResponse { content: string; model: string; inputTokens: number; outputTokens: number; durationMs: number; metadata?: Record<string, unknown>; }
-interface AIStreamChunk { type: "text" | "thinking" | "error" | "done"; content: string; tokensUsed?: number; }
-interface AILog { id: string; sessionId: string; type: AILogType; content: string; tokenCount?: number; model?: string; durationMs?: number; createdAt: string; }
-interface AILogFilter { types?: AILogType[]; startDate?: string; endDate?: string; search?: string; limit?: number; offset?: number; }
-interface AIUsageStats { inputTokens: number; outputTokens: number; requestCount: number; estimatedCostUsd: number; }
+interface AIContext {
+  id: string;
+  type: string;
+  content: string;
+  metadata?: Record<string, unknown>;
+}
+interface AIResponse {
+  content: string;
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+  durationMs: number;
+  metadata?: Record<string, unknown>;
+}
+interface AIStreamChunk {
+  type: "text" | "thinking" | "error" | "done";
+  content: string;
+  tokensUsed?: number;
+}
+interface AILog {
+  id: string;
+  sessionId: string;
+  type: AILogType;
+  content: string;
+  tokenCount?: number;
+  model?: string;
+  durationMs?: number;
+  createdAt: string;
+}
+interface AILogFilter {
+  types?: AILogType[];
+  startDate?: string;
+  endDate?: string;
+  search?: string;
+  limit?: number;
+  offset?: number;
+}
+interface AIUsageStats {
+  inputTokens: number;
+  outputTokens: number;
+  requestCount: number;
+  estimatedCostUsd: number;
+}
 
 interface AIAgentProvider {
   readonly name: string;
   createSession(config: AISessionConfig): Promise<AISession>;
-  sendPrompt(sessionId: string, prompt: string, context?: AIContext[]): Promise<AIResponse>;
-  streamPrompt?(sessionId: string, prompt: string, context?: AIContext[], onChunk?: (chunk: AIStreamChunk) => void): Promise<AIResponse>;
+  sendPrompt(
+    sessionId: string,
+    prompt: string,
+    context?: AIContext[],
+  ): Promise<AIResponse>;
+  streamPrompt?(
+    sessionId: string,
+    prompt: string,
+    context?: AIContext[],
+    onChunk?: (chunk: AIStreamChunk) => void,
+  ): Promise<AIResponse>;
   getSessionLogs(sessionId: string, filter?: AILogFilter): Promise<AILog[]>;
   getUsageStats(sessionId: string): Promise<AIUsageStats>;
-  configureSession(sessionId: string, config: Partial<AISessionConfig>): Promise<void>;
+  configureSession(
+    sessionId: string,
+    config: Partial<AISessionConfig>,
+  ): Promise<void>;
   destroySession(sessionId: string): Promise<void>;
   listSessions(): Promise<AISession[]>;
   getSessionStatus(sessionId: string): Promise<AISessionStatus>;
   healthCheck(): Promise<{ ok: boolean; message?: string }>;
   getCapabilities?(): Record<string, boolean>;
-  getMode?(): string;
-  setMode?(_mode: string): void;
+  getMode?(): ProviderMode;
+  setMode?(_mode: ProviderMode): void;
 }
 
 interface LogIngester {
-  append(input: { sessionId: string; type: AILogType; content: string; tokenCount?: number; model?: string; durationMs?: number; }): unknown;
+  append(input: {
+    sessionId: string;
+    type: AILogType;
+    content: string;
+    tokenCount?: number;
+    model?: string;
+    durationMs?: number;
+  }): unknown;
 }
 
 // ── Provider Implementation ──────────────────────────────────────────────
@@ -89,6 +173,9 @@ interface LogIngester {
 const PROVIDER_NAME = "goose";
 const CLI_COMMAND = "goose";
 const DISPLAY = "Goose";
+const API_PREFIX = `/api/ai-${PROVIDER_NAME}`;
+const SUPPORTED_MODES: ProviderMode[] = ["cli"];
+const CLI_INSTALL_KIND = "manual" as const;
 
 interface ManagedSession {
   id: string;
@@ -107,34 +194,78 @@ class ProviderImpl implements AIAgentProvider {
 
   setHostServices(hs: HostServices) {
     this.hostServices = hs;
-    this.logIngester = hs.serviceRegistry?.getService<LogIngester>("ai", "log-ingester") ?? null;
+    this.logIngester =
+      hs.serviceRegistry?.getService<LogIngester>("ai", "log-ingester") ?? null;
   }
 
   async createSession(config: AISessionConfig): Promise<AISession> {
-    const id = (config.providerConfig?.["sessionId"] as string) || crypto.randomUUID();
+    const id =
+      (config.providerConfig?.["sessionId"] as string) || crypto.randomUUID();
     const now = new Date().toISOString();
     const existing = this.sessions.get(id);
     if (existing) {
       existing.status = "active";
       existing.updatedAt = now;
-      return { id, name: existing.config.name, status: "active", agentType: existing.config.agentType, provider: PROVIDER_NAME, config: existing.config, stats: existing.stats, createdAt: existing.createdAt, updatedAt: now };
+      return {
+        id,
+        name: existing.config.name,
+        status: "active",
+        agentType: existing.config.agentType,
+        provider: PROVIDER_NAME,
+        config: existing.config,
+        stats: existing.stats,
+        createdAt: existing.createdAt,
+        updatedAt: now,
+      };
     }
-    const session: ManagedSession = { id, config, status: "active", stats: { inputTokens: 0, outputTokens: 0, requestCount: 0, estimatedCostUsd: 0 }, createdAt: now, updatedAt: now };
+    const session: ManagedSession = {
+      id,
+      config,
+      status: "active",
+      stats: {
+        inputTokens: 0,
+        outputTokens: 0,
+        requestCount: 0,
+        estimatedCostUsd: 0,
+      },
+      createdAt: now,
+      updatedAt: now,
+    };
     this.sessions.set(id, session);
-    return { id, name: config.name, status: "active", agentType: config.agentType, provider: PROVIDER_NAME, config, stats: session.stats, createdAt: now, updatedAt: now };
+    return {
+      id,
+      name: config.name,
+      status: "active",
+      agentType: config.agentType,
+      provider: PROVIDER_NAME,
+      config,
+      stats: session.stats,
+      createdAt: now,
+      updatedAt: now,
+    };
   }
 
-  async sendPrompt(sessionId: string, prompt: string, context?: AIContext[]): Promise<AIResponse> {
+  async sendPrompt(
+    sessionId: string,
+    prompt: string,
+    context?: AIContext[],
+  ): Promise<AIResponse> {
     const session = this.sessions.get(sessionId);
     if (!session) throw new Error(`Session ${sessionId} not found`);
-    if (session.status === "terminated") throw new Error("Session is terminated");
+    if (session.status === "terminated")
+      throw new Error("Session is terminated");
     session.status = "processing";
     session.updatedAt = new Date().toISOString();
     const startTime = Date.now();
 
     let fullPrompt = prompt;
     if (context?.length) {
-      fullPrompt = prompt + "\n\n" + context.map(c => `--- Context (${c.type}): ---\n${c.content}`).join("\n\n");
+      fullPrompt =
+        prompt +
+        "\n\n" +
+        context
+          .map((c) => `--- Context (${c.type}): ---\n${c.content}`)
+          .join("\n\n");
     }
 
     this.logIngester?.append({ sessionId, type: "input", content: prompt });
@@ -142,7 +273,8 @@ class ProviderImpl implements AIAgentProvider {
     try {
       const args = CLI_ARGS_FN(session.config, fullPrompt);
       const proc = Bun.spawn([CLI_COMMAND, ...args], {
-        stdout: "pipe", stderr: "pipe",
+        stdout: "pipe",
+        stderr: "pipe",
         cwd: session.config.workingDirectory || process.cwd(),
         timeout: 300_000,
       });
@@ -151,7 +283,8 @@ class ProviderImpl implements AIAgentProvider {
       const exitCode = await proc.exited;
       const durationMs = Date.now() - startTime;
 
-      if (exitCode !== 0 && !stdout) throw new Error(`${DISPLAY} exited with code ${exitCode}: ${stderr}`);
+      if (exitCode !== 0 && !stdout)
+        throw new Error(`${DISPLAY} exited with code ${exitCode}: ${stderr}`);
       const content = stdout.trim() || stderr.trim();
       const inputTokens = Math.ceil(fullPrompt.length / 4);
       const outputTokens = Math.ceil(content.length / 4);
@@ -160,8 +293,22 @@ class ProviderImpl implements AIAgentProvider {
       session.stats.requestCount += 1;
       session.status = "active";
       session.updatedAt = new Date().toISOString();
-      this.logIngester?.append({ sessionId, type: "output", content, tokenCount: outputTokens, model: "default", durationMs });
-      return { content, model: "default", inputTokens, outputTokens, durationMs, metadata: { exitCode, provider: PROVIDER_NAME, mode: "cli" } };
+      this.logIngester?.append({
+        sessionId,
+        type: "output",
+        content,
+        tokenCount: outputTokens,
+        model: "default",
+        durationMs,
+      });
+      return {
+        content,
+        model: "default",
+        inputTokens,
+        outputTokens,
+        durationMs,
+        metadata: { exitCode, provider: PROVIDER_NAME, mode: "cli" },
+      };
     } catch (err) {
       session.status = "error";
       session.updatedAt = new Date().toISOString();
@@ -171,24 +318,101 @@ class ProviderImpl implements AIAgentProvider {
     }
   }
 
-  async getSessionLogs(_sessionId: string, _filter?: AILogFilter): Promise<AILog[]> { return []; }
-  async getUsageStats(sessionId: string): Promise<AIUsageStats> { return this.sessions.get(sessionId)?.stats ?? { inputTokens: 0, outputTokens: 0, requestCount: 0, estimatedCostUsd: 0 }; }
-  async configureSession(sessionId: string, config: Partial<AISessionConfig>): Promise<void> { const s = this.sessions.get(sessionId); if (s) { Object.assign(s.config, config); s.updatedAt = new Date().toISOString(); } }
-  async destroySession(sessionId: string): Promise<void> { const s = this.sessions.get(sessionId); if (s) { s.status = "terminated"; s.updatedAt = new Date().toISOString(); } }
-  async listSessions(): Promise<AISession[]> { return Array.from(this.sessions.values()).map(s => ({ id: s.id, name: s.config.name, status: s.status, agentType: s.config.agentType, provider: PROVIDER_NAME, config: s.config, stats: s.stats, createdAt: s.createdAt, updatedAt: s.updatedAt })); }
-  async getSessionStatus(sessionId: string): Promise<AISessionStatus> { return this.sessions.get(sessionId)?.status ?? "terminated"; }
+  async getSessionLogs(
+    _sessionId: string,
+    _filter?: AILogFilter,
+  ): Promise<AILog[]> {
+    return [];
+  }
+  async getUsageStats(sessionId: string): Promise<AIUsageStats> {
+    return (
+      this.sessions.get(sessionId)?.stats ?? {
+        inputTokens: 0,
+        outputTokens: 0,
+        requestCount: 0,
+        estimatedCostUsd: 0,
+      }
+    );
+  }
+  async configureSession(
+    sessionId: string,
+    config: Partial<AISessionConfig>,
+  ): Promise<void> {
+    const s = this.sessions.get(sessionId);
+    if (s) {
+      Object.assign(s.config, config);
+      s.updatedAt = new Date().toISOString();
+    }
+  }
+  async destroySession(sessionId: string): Promise<void> {
+    const s = this.sessions.get(sessionId);
+    if (s) {
+      s.status = "terminated";
+      s.updatedAt = new Date().toISOString();
+    }
+  }
+  async listSessions(): Promise<AISession[]> {
+    return Array.from(this.sessions.values()).map((s) => ({
+      id: s.id,
+      name: s.config.name,
+      status: s.status,
+      agentType: s.config.agentType,
+      provider: PROVIDER_NAME,
+      config: s.config,
+      stats: s.stats,
+      createdAt: s.createdAt,
+      updatedAt: s.updatedAt,
+    }));
+  }
+  async getSessionStatus(sessionId: string): Promise<AISessionStatus> {
+    return this.sessions.get(sessionId)?.status ?? "terminated";
+  }
 
   async healthCheck(): Promise<{ ok: boolean; message?: string }> {
     try {
-      const proc = Bun.spawnSync([CLI_COMMAND, "--version"], { timeout: 5000, stdout: "pipe", stderr: "ignore" });
-      if (proc.exitCode === 0) return { ok: true, message: `${DISPLAY} ${proc.stdout.toString().trim()}` };
+      const proc = Bun.spawnSync([CLI_COMMAND, "--version"], {
+        timeout: 5000,
+        stdout: "pipe",
+        stderr: "ignore",
+      });
+      if (proc.exitCode === 0)
+        return {
+          ok: true,
+          message: `${DISPLAY} ${proc.stdout.toString().trim()}`,
+        };
       return { ok: false, message: `${DISPLAY} not available` };
-    } catch { return { ok: false, message: `${DISPLAY} not installed` }; }
+    } catch {
+      return { ok: false, message: `${DISPLAY} not installed` };
+    }
   }
 
-  getCapabilities() { return { streaming: false, vision: false, fileAttachments: false, toolUse: false, mcpSupport: false, voiceMode: false, cancelSupport: true, modelListing: false }; }
-  getMode() { return "cli"; }
-  setMode() { /* CLI only */ }
+  getCapabilities() {
+    return {
+      streaming: false,
+      vision: false,
+      fileAttachments: false,
+      toolUse: false,
+      mcpSupport: false,
+      voiceMode: false,
+      cancelSupport: true,
+      modelListing: false,
+    };
+  }
+  getSupportedModes(): ProviderMode[] {
+    return [...SUPPORTED_MODES];
+  }
+  getDisplayName(): string {
+    return DISPLAY;
+  }
+  getPrereqApiPrefix(): string {
+    return API_PREFIX;
+  }
+  getMode(): ProviderMode {
+    return "cli";
+  }
+  setMode(mode: ProviderMode) {
+    if (mode !== "cli") throw new Error(`${DISPLAY} only supports CLI mode`);
+  }
 
   private log(level: "info" | "error" | "debug", msg: string) {
     this.hostServices?.logger?.[level]?.(`${PROVIDER_NAME}-provider`, msg);
@@ -203,6 +427,60 @@ function CLI_ARGS_FN(_config: AISessionConfig, prompt: string): string[] {
 
 // ── Plugin Export ────────────────────────────────────────────────────────
 
+function getCliVersion(): string | null {
+  try {
+    const proc = Bun.spawnSync([CLI_COMMAND, "--version"], {
+      timeout: 5000,
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+    if (proc.exitCode === 0) return proc.stdout.toString().trim();
+  } catch {
+    // Binary not found.
+  }
+  return null;
+}
+
+function createPrereqsRoutes() {
+  return new Elysia({ prefix: "/prereqs" })
+    .get("/status", () => {
+      const version = getCliVersion();
+      return {
+        satisfied: Boolean(version),
+        missing: version
+          ? []
+          : [
+              {
+                name: CLI_COMMAND,
+                kind: CLI_INSTALL_KIND,
+                requiresSudo: false,
+                description: `${DISPLAY} CLI for CLI mode`,
+              },
+            ],
+      };
+    })
+    .post("/install", () => {
+      if (getCliVersion())
+        return {
+          ok: true,
+          installed: [CLI_COMMAND],
+          pendingSudo: [],
+          errors: [],
+        };
+      return {
+        ok: false,
+        installed: [],
+        pendingSudo: [],
+        errors: [
+          {
+            name: CLI_COMMAND,
+            message: `Install ${DISPLAY} CLI from its vendor instructions and retry.`,
+          },
+        ],
+      };
+    });
+}
+
 const provider = new ProviderImpl();
 
 export const vibePlugin: VibePlugin = {
@@ -210,9 +488,25 @@ export const vibePlugin: VibePlugin = {
   version: "1.0.0",
   description: `${DISPLAY} AI agent provider for VibeControls`,
   tags: ["provider", "integration"],
+  apiPrefix: API_PREFIX,
+  prerequisites: [
+    {
+      name: CLI_COMMAND,
+      kind: CLI_INSTALL_KIND,
+      requiresSudo: false,
+      description: `${DISPLAY} CLI for CLI mode`,
+    },
+  ],
   providers: { ai: provider },
-  onServerStart(_app, hostServices) { if (hostServices) provider.setHostServices(hostServices); },
-  onServerStop() { for (const [id] of provider["sessions"]) { provider.destroySession(id).catch(() => {}); } },
+  createRoutes: () => createPrereqsRoutes(),
+  onServerStart(_app, hostServices) {
+    if (hostServices) provider.setHostServices(hostServices);
+  },
+  onServerStop() {
+    for (const [id] of provider["sessions"]) {
+      provider.destroySession(id).catch(() => {});
+    }
+  },
 };
 
 export default vibePlugin;
