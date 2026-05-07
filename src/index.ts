@@ -11,7 +11,18 @@ import { Elysia } from "elysia";
 
 type ProviderMode = "sdk" | "cli";
 
+interface PluginCapabilities {
+  storage?: "none" | "read" | "rw";
+  secrets?: "none" | "read" | "rw";
+  gateway?: boolean;
+  broadcast?: boolean;
+  subprocess?: boolean;
+  audit?: boolean;
+  telemetry?: boolean;
+}
+
 interface VibePlugin {
+  capabilities?: PluginCapabilities;
   name: string;
   version: string;
   description?: string;
@@ -35,6 +46,9 @@ interface VibePlugin {
 }
 
 interface HostServices {
+  telemetry?: {
+    emit: (name: string, payload?: Record<string, unknown>) => void;
+  };
   logger?: {
     info: (source: string, msg: string) => void;
     warn: (source: string, msg: string) => void;
@@ -172,6 +186,21 @@ interface LogIngester {
 
 const PROVIDER_NAME = "goose";
 const CLI_COMMAND = "goose";
+/**
+ * Resolve CLI binary path with platform-correct extension.
+ * On Windows, Bun.spawn calls CreateProcess directly (no PATHEXT), so a bare
+ * name won't find `name.exe`/`name.cmd`. Bun.which searches PATH like the shell.
+ */
+function resolveCliBin(): string {
+  const found =
+    typeof Bun !== "undefined" && typeof Bun.which === "function"
+      ? Bun.which(CLI_COMMAND)
+      : null;
+  if (found) return found;
+  return process.platform === "win32" ? `${CLI_COMMAND}.exe` : CLI_COMMAND;
+}
+const CLI_BIN = resolveCliBin();
+
 const DISPLAY = "Goose";
 const API_PREFIX = `/api/ai-${PROVIDER_NAME}`;
 const SUPPORTED_MODES: ProviderMode[] = ["cli"];
@@ -272,7 +301,7 @@ class ProviderImpl implements AIAgentProvider {
 
     try {
       const args = CLI_ARGS_FN(session.config, fullPrompt);
-      const proc = Bun.spawn([CLI_COMMAND, ...args], {
+      const proc = Bun.spawn([CLI_BIN, ...args], {
         stdout: "pipe",
         stderr: "pipe",
         cwd: session.config.workingDirectory || process.cwd(),
@@ -370,7 +399,7 @@ class ProviderImpl implements AIAgentProvider {
 
   async healthCheck(): Promise<{ ok: boolean; message?: string }> {
     try {
-      const proc = Bun.spawnSync([CLI_COMMAND, "--version"], {
+      const proc = Bun.spawnSync([CLI_BIN, "--version"], {
         timeout: 5000,
         stdout: "pipe",
         stderr: "ignore",
@@ -429,7 +458,7 @@ function CLI_ARGS_FN(_config: AISessionConfig, prompt: string): string[] {
 
 function getCliVersion(): string | null {
   try {
-    const proc = Bun.spawnSync([CLI_COMMAND, "--version"], {
+    const proc = Bun.spawnSync([CLI_BIN, "--version"], {
       timeout: 5000,
       stdout: "pipe",
       stderr: "ignore",
@@ -484,6 +513,12 @@ function createPrereqsRoutes() {
 const provider = new ProviderImpl();
 
 export const vibePlugin: VibePlugin = {
+  capabilities: {
+    secrets: "read",
+    subprocess: true,
+    gateway: false,
+    telemetry: true,
+  },
   name: PROVIDER_NAME,
   version: "1.0.0",
   description: `${DISPLAY} AI agent provider for VibeControls`,
@@ -500,6 +535,7 @@ export const vibePlugin: VibePlugin = {
   providers: { ai: provider },
   createRoutes: () => createPrereqsRoutes(),
   onServerStart(_app, hostServices) {
+    hostServices?.telemetry?.emit("ai.provider.ready", { provider: "goose" });
     if (hostServices) provider.setHostServices(hostServices);
   },
   onServerStop() {
