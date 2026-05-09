@@ -6,7 +6,7 @@
  */
 
 import { Elysia } from "elysia";
-import type { HostServices, VibePlugin } from "@vibecontrols/plugin-sdk";
+import type { HostServices, VibePlugin, ProfileContext } from "@vibecontrols/plugin-sdk";
 import {
   BoundLogger,
   ProviderRegistry,
@@ -497,7 +497,7 @@ type GooseVibePlugin = VibePlugin & {
   providers?: { ai?: AIAgentProvider };
 };
 
-export const vibePlugin: GooseVibePlugin = {
+export const createPlugin = (_ctx: ProfileContext): GooseVibePlugin => ({
   capabilities: {
     secrets: "read",
     subprocess: true,
@@ -520,6 +520,4 @@ export const vibePlugin: GooseVibePlugin = {
   createRoutes: () => createPrereqsRoutes(),
   onServerStart: lifecycle.onServerStart,
   onServerStop: lifecycle.onServerStop,
-};
-
-export default vibePlugin;
+});
