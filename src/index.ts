@@ -6,7 +6,11 @@
  */
 
 import { Elysia } from "elysia";
-import type { HostServices, VibePlugin, ProfileContext } from "@vibecontrols/plugin-sdk";
+import type {
+  HostServices,
+  VibePlugin,
+  ProfileContext,
+} from "@vibecontrols/plugin-sdk";
 import {
   BoundLogger,
   ProviderRegistry,
@@ -166,7 +170,12 @@ const CLI_BIN = resolveCliBin();
 const DISPLAY = "Goose";
 const API_PREFIX = `/api/ai-${PROVIDER_NAME}`;
 const SUPPORTED_MODES: ProviderMode[] = ["cli"];
-const CLI_INSTALL_KIND = "manual" as const;
+// Block Goose installs a binary via its official curl script. It defaults to
+// the user-writable $HOME/.local/bin (no sudo) and `CONFIGURE=false` keeps it
+// non-interactive. https://block.github.io/goose/docs/getting-started/installation
+const CLI_INSTALL_KIND = "binary" as const;
+const GOOSE_INSTALL_URL =
+  "https://github.com/block/goose/releases/download/stable/download_cli.sh";
 
 interface ManagedSession {
   id: string;
@@ -435,10 +444,82 @@ function getCliVersion(): string | null {
   return null;
 }
 
+/**
+ * Resolve the path the goose installer drops the binary into. The script
+ * defaults to $HOME/.local/bin (honouring GOOSE_BIN_DIR if the operator set
+ * it); that dir is rarely on the agent PATH yet, so we probe the explicit path
+ * after install rather than relying on PATH resolution.
+ */
+function gooseInstalledBin(): string | null {
+  const home = process.env["HOME"];
+  const binDir =
+    process.env["GOOSE_BIN_DIR"] || (home ? `${home}/.local/bin` : null);
+  if (!binDir) return null;
+  const candidate = `${binDir}/${platformExeName(CLI_COMMAND)}`;
+  try {
+    const proc = Bun.spawnSync([candidate, "--version"], {
+      timeout: 5000,
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    if (proc.exitCode === 0) return candidate;
+  } catch {
+    // Not present at the expected location.
+  }
+  return null;
+}
+
+/**
+ * Install Goose via its official curl|bash script. The agent image ships curl
+ * + bash but not npm, so a curl-script install is the runtime-resilient path.
+ * `CONFIGURE=false` keeps it non-interactive and the default $HOME/.local/bin
+ * target needs no sudo.
+ */
+function installGooseViaScript(): { ok: boolean; message: string } {
+  const curl = Bun.which("curl", { PATH: process.env.PATH });
+  const bash = Bun.which("bash", { PATH: process.env.PATH });
+  if (!curl || !bash) {
+    const missing = [!curl ? "curl" : null, !bash ? "bash" : null]
+      .filter(Boolean)
+      .join(" and ");
+    return {
+      ok: false,
+      message:
+        `Cannot auto-install ${DISPLAY}: ${missing} not found on PATH. ` +
+        `Install ${missing}, or install manually: ` +
+        `curl -fsSL ${GOOSE_INSTALL_URL} | CONFIGURE=false bash`,
+    };
+  }
+  try {
+    const proc = Bun.spawnSync(
+      ["bash", "-c", `curl -fsSL ${GOOSE_INSTALL_URL} | CONFIGURE=false bash`],
+      {
+        timeout: 180_000,
+        stdout: "pipe",
+        stderr: "pipe",
+        env: { ...(process.env as Record<string, string>), CONFIGURE: "false" },
+      },
+    );
+    if (proc.exitCode === 0) return { ok: true, message: "goose installed" };
+    return {
+      ok: false,
+      message:
+        proc.stderr.toString().trim() ||
+        proc.stdout.toString().trim() ||
+        `goose install script exited ${proc.exitCode}`,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      message: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
 function createPrereqsRoutes() {
   return new Elysia({ prefix: "/prereqs" })
     .get("/status", () => {
-      const version = getCliVersion();
+      const version = getCliVersion() ?? gooseInstalledBin();
       return {
         satisfied: Boolean(version),
         missing: version
@@ -454,7 +535,16 @@ function createPrereqsRoutes() {
       };
     })
     .post("/install", () => {
-      if (getCliVersion())
+      if (getCliVersion() || gooseInstalledBin())
+        return {
+          ok: true,
+          installed: [CLI_COMMAND],
+          pendingSudo: [],
+          errors: [],
+        };
+
+      const result = installGooseViaScript();
+      if (result.ok && (getCliVersion() || gooseInstalledBin()))
         return {
           ok: true,
           installed: [CLI_COMMAND],
@@ -468,7 +558,10 @@ function createPrereqsRoutes() {
         errors: [
           {
             name: CLI_COMMAND,
-            message: `Install ${DISPLAY} CLI from its vendor instructions and retry.`,
+            message: result.ok
+              ? `${DISPLAY} install script reported success but the binary was not found. ` +
+                `Ensure $HOME/.local/bin (or GOOSE_BIN_DIR) is on PATH.`
+              : result.message,
           },
         ],
       };
