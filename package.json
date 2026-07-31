@@ -10,7 +10,7 @@
   "scripts": {
     "build": "bun build ./src/index.ts --outdir ./dist --target bun --minify-syntax --minify-whitespace --external elysia && tsc --emitDeclarationOnly --declaration --outDir ./dist",
     "dev": "tsc --watch",
-    "type:check": "tsc --noEmit",
+    "type:check": "bash scripts/build-limits.sh tsc --noEmit",
     "clean": "rimraf dist",
     "prebuild": "bun run clean",
     "lint": "echo skip lint",
