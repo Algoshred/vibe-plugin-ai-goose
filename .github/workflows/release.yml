@@ -1,0 +1,75 @@
+# vendored from algoshred/ci-workflows@c3f35eb994c2b554eb1a3c61b7ee12e2a687521c
+# source: templates/plugin/release.yml. Do not edit: regenerate with scripts/vendor.ts in algoshred/ci-workflows.
+# Release caller for a public vibe plugin (plan sections 8.3 and 10.7).
+#
+# Every push to main publishes the next free CalVer (YYYY.MDD.PATCH) of the
+# package to npmjs under the `latest` dist-tag, as the plugin fleet always has.
+# A pushed CalVer tag releases exactly that version, and a manual dispatch
+# releases the given version (or the next free one when left empty).
+#
+# node-lib-release.yml runs a frozen install, `boff sanity --force` (format
+# check, lint, bun check, build with `tsc --emitDeclarationOnly`, tests), stamps
+# the version, rebuilds, checks the tarball and publishes with npm provenance
+# (these repositories are public). common-release-finalize.yml then waits until
+# npm actually serves the version, verifies the tarball digest, tags the
+# released commit and creates the GitHub Release.
+#
+# Public repositories cannot read the org secret NPM_TOKEN, so the publish token
+# is the repository secret NPMJS_VIBECONTROLS_TOKEN (NPM_TOKEN stays as a
+# fallback for repositories that were given one).
+#
+# Vendored with scripts/vendor.ts together with plugin/pr-check.yml.
+name: Release
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - '[0-9][0-9][0-9][0-9].[0-9]*.[0-9]*'
+    # Documentation-only pushes do not publish a new version. This workflow
+    # never emits PR Gate, so the filter cannot wedge a required check.
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.gitignore'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: CalVer version to release (YYYY.MDD.PATCH). Empty = next free patch for today.
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    uses: ./.github/workflows/ci-workflows--node-lib-release.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      # Every plugin publishes as @vibecontrols/<repository name>; the release
+      # fails if package.json says otherwise.
+      package-name: '@vibecontrols/${{ github.event.repository.name }}'
+      version: ${{ inputs.version || '' }}
+      verify-command: ./node_modules/.bin/boff sanity --force
+      provenance: true
+    secrets:
+      NPM_TOKEN: ${{ secrets.NPMJS_VIBECONTROLS_TOKEN || secrets.NPM_TOKEN }}
+
+  finalize:
+    needs: publish
+    uses: ./.github/workflows/ci-workflows--common-release-finalize.yml
+    permissions:
+      contents: write
+    with:
+      registry: npm
+      package-name: ${{ needs.publish.outputs.package-name }}
+      version: ${{ needs.publish.outputs.version }}

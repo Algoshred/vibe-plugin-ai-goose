@@ -12,7 +12,6 @@ import type {
   ProfileContext,
 } from "@vibecontrols/plugin-sdk";
 import {
-  BoundLogger,
   ProviderRegistry,
   TelemetryEmitter,
   createLifecycleHooks,
@@ -190,12 +189,8 @@ class ProviderImpl implements AIAgentProvider {
   readonly name = PROVIDER_NAME;
   private sessions = new Map<string, ManagedSession>();
   private logIngester: LogIngester | null = null;
-  private hostServices: HostServices | null = null;
-  private logger: BoundLogger | null = null;
 
   setHostServices(hs: HostServices) {
-    this.hostServices = hs;
-    this.logger = new BoundLogger(hs.logger, `${PROVIDER_NAME}-provider`);
     const registry = new ProviderRegistry(hs);
     this.logIngester =
       registry.getProvider<LogIngester>("ai", "log-ingester") ?? null;
@@ -415,10 +410,6 @@ class ProviderImpl implements AIAgentProvider {
   }
   setMode(mode: ProviderMode) {
     if (mode !== "cli") throw new Error(`${DISPLAY} only supports CLI mode`);
-  }
-
-  private log(level: "info" | "error" | "debug", msg: string) {
-    this.logger?.[level](msg);
   }
 }
 
